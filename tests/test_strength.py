@@ -1,10 +1,15 @@
+import math
+
 import pytest
 
 from auditor.strength import (
+    SECONDS_PER_YEAR,
     character_classes,
     check_password,
+    estimate_times,
     find_repeats,
     find_sequences,
+    format_duration,
     load_wordlist,
 )
 
@@ -18,6 +23,7 @@ def test_empty_password(common):
     r = check_password("", common)
     assert r.score == 0
     assert r.label == "Very Weak"
+    assert r.estimates == []
     assert r.classes == []
     assert r.issues == ["password is empty"]
 
@@ -70,6 +76,35 @@ def test_patterns_show_up_as_issues(common):
 def test_character_classes_including_unicode_and_space():
     assert character_classes("aA1! é") == ["lower", "upper", "digit", "symbol", "other"]
     assert character_classes("1234") == ["digit"]
+
+
+def test_estimates(common):
+    # four digits is 10 ** 4 combinations, half on average, so 5000 guesses
+    est = {e.key: e.human for e in estimate_times(4, 10)}
+    assert est["online_throttled"] == "about 2 days"
+    assert est["online_unthrottled"] == "about 5 seconds"
+    assert est["offline_slow_hash"] == "under a second"
+    assert est["offline_fast_hash"] == "under a second"
+
+    # a higher assumed rate should never give a longer time
+    times = [e.log10_seconds for e in check_password("Kq9#Zm2$Xv7!", common).estimates]
+    assert len(times) == 4
+    assert times == sorted(times, reverse=True)
+
+
+def test_format_duration():
+    assert format_duration(-1) == "under a second"
+    assert format_duration(math.log10(5 * 3600)) == "about 5 hours"
+    assert format_duration(math.log10(3 * SECONDS_PER_YEAR)) == "about 3 years"
+    assert format_duration(math.log10(2e9 * SECONDS_PER_YEAR)) == "about 2 billion years"
+    assert format_duration(400) == "over a trillion years"
+
+
+def test_extremely_long_password_does_not_overflow():
+    pw = "aB3$" * 25_000
+    r = check_password(pw, set())
+    assert r.length == 100_000
+    assert all(e.human == "over a trillion years" for e in r.estimates)
 
 
 def test_wordlists(tmp_path, common):

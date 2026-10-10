@@ -1,9 +1,11 @@
-"""Password strength scoring.
+"""Password strength scoring and rough brute force time estimates.
 
-The score is a plain rule-based point system. Brute force time estimates
-get added on top of this later.
+The score is a plain rule-based point system. The time estimates use the
+usual "charset size to the power of length" math and are kept separate from
+the score on purpose (see the design notes in the README).
 """
 
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,10 +35,34 @@ LABELS = [
     (0, "Very Weak"),
 ]
 
+# Assumed guess rates. These are round numbers I picked to show the spread
+# between scenarios. None of them were measured by this project.
+# (key, display name, guesses per second, how the rate is described)
+GUESS_SCENARIOS = [
+    ("online_throttled", "Online, rate limited", 100 / 3600, "100 guesses/hour"),
+    ("online_unthrottled", "Online, no limit", 1_000, "1,000 guesses/second"),
+    ("offline_slow_hash", "Offline, slow hash", 10_000, "10,000 guesses/second"),
+    ("offline_fast_hash", "Offline, fast hash", 10_000_000_000, "10 billion guesses/second"),
+]
+
 # Size of each character pool used for the estimate. Non-ASCII characters get
 # a flat 100, which is a placeholder and not a real count.
 POOL_SIZES = {"lower": 26, "upper": 26, "digit": 10, "symbol": 33, "other": 100}
 
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_DAY = 86400
+SECONDS_PER_YEAR = 31_557_600
+
+
+@dataclass
+class Estimate:
+    key: str
+    name: str
+    rate_description: str
+    guesses_per_second: float
+    log10_seconds: float
+    human: str
 
 
 @dataclass
@@ -48,6 +74,7 @@ class StrengthResult:
     pool_size: int
     in_common_list: bool
     issues: list = field(default_factory=list)
+    estimates: list = field(default_factory=list)
 
     def to_dict(self):
         return {
@@ -58,6 +85,15 @@ class StrengthResult:
             "pool_size": self.pool_size,
             "in_common_list": self.in_common_list,
             "issues": self.issues,
+            "estimates": [
+                {
+                    "scenario": e.key,
+                    "assumed_rate": e.rate_description,
+                    "average_time": e.human,
+                    "log10_seconds": round(e.log10_seconds, 2),
+                }
+                for e in self.estimates
+            ],
         }
 
 
@@ -133,6 +169,77 @@ def _label_for(score):
     return LABELS[-1][1]
 
 
+def format_duration(log10_seconds):
+    """Turn a log10 of seconds into a deliberately coarse phrase.
+
+    Working in logs because a long password gives a number far too big for
+    a float. Everything is rounded to one significant figure so the output
+    doesn't suggest more precision than the inputs have.
+    """
+    if log10_seconds < 0:
+        return "under a second"
+
+    # 1e30 seconds is far past a trillion years, and going much further
+    # would overflow the float in 10 ** x
+    if log10_seconds > 30:
+        return "over a trillion years"
+
+    seconds = 10 ** log10_seconds
+
+    if seconds < SECONDS_PER_MINUTE:
+        return _phrase(seconds, "second")
+    if seconds < SECONDS_PER_HOUR:
+        return _phrase(seconds / SECONDS_PER_MINUTE, "minute")
+    if seconds < SECONDS_PER_DAY:
+        return _phrase(seconds / SECONDS_PER_HOUR, "hour")
+    if seconds < SECONDS_PER_YEAR:
+        return _phrase(seconds / SECONDS_PER_DAY, "day")
+
+    years = seconds / SECONDS_PER_YEAR
+    if years < 1_000:
+        return _phrase(years, "year")
+    if years < 1_000_000:
+        return _phrase(years / 1_000, "thousand years", plural=False)
+    if years < 1_000_000_000:
+        return _phrase(years / 1_000_000, "million years", plural=False)
+    if years < 1_000_000_000_000:
+        return _phrase(years / 1_000_000_000, "billion years", plural=False)
+    return "over a trillion years"
+
+
+def _phrase(value, unit, plural=True):
+    rounded = _round_one_sig(value)
+    if plural and rounded != 1:
+        unit += "s"
+    return f"about {rounded} {unit}"
+
+
+def _round_one_sig(x):
+    if x <= 0:
+        return 0
+    digits = -int(math.floor(math.log10(x)))
+    rounded = round(x, digits)
+    return int(rounded) if rounded >= 1 else rounded
+
+
+def estimate_times(length, pool_size):
+    """Average-case time to find a password by trying everything.
+
+    Average case is half the keyspace. This assumes the attacker has no
+    idea how the password was made, which flatters human-picked passwords.
+    """
+    if length == 0 or pool_size == 0:
+        return []
+    log10_avg_guesses = length * math.log10(pool_size) - math.log10(2)
+    estimates = []
+    for key, name, rate, rate_text in GUESS_SCENARIOS:
+        log10_seconds = log10_avg_guesses - math.log10(rate)
+        estimates.append(
+            Estimate(key, name, rate_text, rate, log10_seconds, format_duration(log10_seconds))
+        )
+    return estimates
+
+
 def check_password(password, common_passwords=None):
     """Score a password and attach time estimates.
 
@@ -196,4 +303,5 @@ def check_password(password, common_passwords=None):
         pool_size=pool_size,
         in_common_list=in_common_list,
         issues=issues,
+        estimates=estimate_times(length, pool_size),
     )
